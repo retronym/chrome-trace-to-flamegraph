@@ -21,13 +21,18 @@ object ChromeTraceFlame {
                     var cname: String = "",
                     var duration: Long = -1,
                     var argName: String = "",
-                    var argValue: Long = 0L)
+                    var argValue: Long = 0L,
+                    var savedStack: List[Record] = null,
+                    var nestedTime: Long = 0L
+                   ) {
 
-  class RecordStack {
-    val data = new mutable.ArrayStack[Record]()
+
   }
 
-  val asyncSlices = mutable.HashMap[Long, RecordStack]()
+  class RecordStack {
+    var data = new mutable.ArrayStack[Record]()
+  }
+
   val threadSlices = mutable.HashMap[String, RecordStack]()
   val counterEvents = mutable.HashMap[String, mutable.TreeMap[Long, Record]]()
   val gcPauses = TreeRangeSet.create[java.lang.Long]()
@@ -40,7 +45,9 @@ object ChromeTraceFlame {
   def read(files: List[Path]): Unit = {
     val factory = new JsonFactory()
     val outFileName = "/tmp/combined.trace"
+    val outStacksFileName = "/tmp/combined.csv"
     val writer = Files.newBufferedWriter(Paths.get(outFileName))
+    val stacksWriter = Files.newBufferedWriter(Paths.get(outStacksFileName))
     val generator = factory.createGenerator(writer)
 
     def parse(gcOnly: Boolean): Unit = {
@@ -131,9 +138,50 @@ object ChromeTraceFlame {
               }
 
             } else {
+              def writeCompleteEvent(recordStack: RecordStack, record: Record, durationRange: collect.Range[lang.Long], rangeFudge: Long): Unit = {
+                if ((durationRange.upperEndpoint() - durationRange.lowerEndpoint() > 100) && threadSlices.size > 0) {
+                  val delta = durationRange.upperEndpoint() - durationRange.lowerEndpoint()
+                  generator.writeRaw("\n")
+                  generator.writeStartObject()
+                  generator.writeStringField("cat", record.cat)
+                  generator.writeStringField("name", record.name)
+                  generator.writeStringField("ph", "X")
+                  generator.writeNumberField("id", record.id)
+                  generator.writeStringField("tid", record.tid)
+                  generator.writeStringField("pid", record.pid)
+                  generator.writeNumberField("ts", durationRange.lowerEndpoint() + rangeFudge)
+                  generator.writeNumberField("dur", durationRange.upperEndpoint() - durationRange.lowerEndpoint() - rangeFudge * 2)
+                  if (record.cname != "")
+                    generator.writeStringField("cname", record.cname)
+                  generator.writeEndObject()
+
+                  for (enclosing <- recordStack.data.iterator.drop(1)) {
+                    enclosing.nestedTime += (delta - record.nestedTime)
+                  }
+                  stacksWriter.write(recordStack.data.reverseIterator.map(_.name).mkString("", ";", ";"))
+                  stacksWriter.write((delta - record.nestedTime).toString)
+                  stacksWriter.write("\n")
+                }
+              }
+
+              def writeCompleteEventWithGcCuts(recordStack: RecordStack, record: Record, durationRange: collect.Range[lang.Long], rangeFudge: Long) = {
+                val gcIntersects = recordStack.data.size > 1 && gcPauses.intersects(durationRange)
+                if (gcIntersects) {
+                  val durationSet = TreeRangeSet.create[lang.Long]()
+                  durationSet.add(durationRange)
+                  durationSet.removeAll(gcPauses.subRangeSet(durationRange))
+                  val iterator = durationSet.asRanges().iterator()
+                  while (iterator.hasNext) {
+                    val activeRange = iterator.next()
+                    writeCompleteEvent(recordStack, record, activeRange, rangeFudge = rangeFudge)
+                  }
+                } else
+                  writeCompleteEvent(recordStack, record, durationRange, rangeFudge = rangeFudge)
+              }
+
               ph match {
                 case "B" =>
-                  val recordStack = asyncSlices.getOrElseUpdate(id, new RecordStack)
+                  val recordStack = threadSlices.getOrElseUpdate(tid, new RecordStack)
                   val record = new Record
                   record.cat = cat
                   record.name = name
@@ -143,39 +191,35 @@ object ChromeTraceFlame {
                   record.tid = tid
                   record.ts = ts
                   record.cname = cname
-                  recordStack.data.push(record)
-                case "E" =>
-                  val recordStack = asyncSlices(id)
-                  val record = recordStack.data.pop()
-                  record.duration = ts - record.ts
-                  def writeEvent(durationRange: collect.Range[lang.Long], rangeFudge: Long): Unit = {
-                    generator.writeRaw("\n")
-                    generator.writeStartObject()
-                    generator.writeStringField("cat", record.cat)
-                    generator.writeStringField("name", record.name)
-                    generator.writeStringField("ph", "X")
-                    generator.writeNumberField("id", record.id)
-                    generator.writeStringField("tid", record.tid)
-                    generator.writeStringField("pid", record.pid)
-                    generator.writeNumberField("ts", durationRange.lowerEndpoint() + rangeFudge)
-                    generator.writeNumberField("dur", durationRange.upperEndpoint() - durationRange.lowerEndpoint() - rangeFudge * 2)
-                    if (record.cname != "")
-                      generator.writeStringField("cname", record.cname)
-                    generator.writeEndObject()
-                  }
-                  val durationRange: collect.Range[lang.Long] = com.google.common.collect.Range.closed[java.lang.Long](record.ts, record.ts + record.duration)
-                  val gcIntersects = gcPauses.intersects(durationRange)
-                  if (gcIntersects) {
-                    val durationSet = TreeRangeSet.create[java.lang.Long]()
-                    durationSet.add(durationRange)
-                    durationSet.removeAll(gcPauses.subRangeSet(durationRange))
-                    val iterator = durationSet.asRanges().iterator()
-                    while (iterator.hasNext) {
-                      val activeRange = iterator.next()
-                      writeEvent(activeRange, rangeFudge = recordStack.data.size)
+
+                  if (name == "↯") {
+                    record.savedStack = recordStack.data.toList
+                    var i = 0
+                    for (enclosingToStop <- record.savedStack.reverseIterator.drop(1)) {
+                      i += 1
+                      val durationRange: collect.Range[lang.Long] = com.google.common.collect.Range.closed[java.lang.Long](enclosingToStop.ts, ts)
+                      writeCompleteEventWithGcCuts(recordStack, enclosingToStop, durationRange, i)
                     }
-                  } else
-                    writeEvent(durationRange, rangeFudge = 0L)
+                    recordStack.data = mutable.ArrayStack[Record](record)
+                  } else {
+                    recordStack.data.push(record)
+                  }
+                case "E" =>
+                  val recordStack = threadSlices(tid)
+                  val record = recordStack.data.top
+                  record.duration = ts - record.ts
+                  val durationRange: collect.Range[lang.Long] = com.google.common.collect.Range.closed[lang.Long](record.ts, record.ts + record.duration)
+                  if (name == "↯") {
+                    recordStack.data = collection.mutable.ArrayStack[Record](record.savedStack: _*)
+                    var i = 0
+                    for (restored <- record.savedStack.dropRight(1)) {
+                      i += 1
+                      restored.ts = ts// + i
+                    }
+                  } else {
+                    writeCompleteEventWithGcCuts(recordStack, record, durationRange, recordStack.data.size)
+                    recordStack.data.pop()
+                  }
                 case "C" =>
                   val map = counterEvents.getOrElseUpdate(pid, new mutable.TreeMap[Long, Record]())
                   val record = new Record
@@ -251,6 +295,7 @@ object ChromeTraceFlame {
     } finally {
       generator.close()
       writer.close()
+      stacksWriter.close()
     }
   }
 }
