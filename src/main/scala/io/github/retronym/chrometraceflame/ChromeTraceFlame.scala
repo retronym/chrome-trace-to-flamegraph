@@ -2,6 +2,7 @@ package io.github.retronym.chrometraceflame
 
 import java.lang
 import java.nio.file.{Files, Path, Paths}
+import java.util.Comparator
 
 import com.fasterxml.jackson.core._
 import com.google.common.collect
@@ -25,7 +26,10 @@ object ChromeTraceFlame {
                     var savedStack: List[Record] = null,
                     var nestedTime: Long = 0L
                    ) {
-
+    def flameName = cat match {
+      case "run" | "phase" | "file" => cat + "=" + name
+      case _ => name
+    }
 
   }
 
@@ -33,9 +37,16 @@ object ChromeTraceFlame {
     var data = new mutable.ArrayStack[Record]()
   }
 
+  class FlamegraphStack(val stackString: String) {
+    var duration: Long = 0
+    def +=(d: Long) = duration += d
+  }
+
+
   val threadSlices = mutable.HashMap[String, RecordStack]()
   val counterEvents = mutable.HashMap[String, mutable.TreeMap[Long, Record]]()
   val gcPauses = TreeRangeSet.create[java.lang.Long]()
+  val flameStacks = mutable.HashMap[String, FlamegraphStack]()
 
   def main(args: Array[String]): Unit = {
     val paths = args.toList.map(Paths.get(_))
@@ -49,6 +60,10 @@ object ChromeTraceFlame {
     val writer = Files.newBufferedWriter(Paths.get(outFileName))
     val stacksWriter = Files.newBufferedWriter(Paths.get(outStacksFileName))
     val generator = factory.createGenerator(writer)
+
+    def isUnbreakable(r: Record) = {
+      r.cat == "run" || r.cat == "phase"
+    }
 
     def parse(gcOnly: Boolean): Unit = {
       for (file <- files) {
@@ -155,12 +170,13 @@ object ChromeTraceFlame {
                     generator.writeStringField("cname", record.cname)
                   generator.writeEndObject()
 
-                  for (enclosing <- recordStack.data.iterator.drop(1)) {
+                  for (enclosing <- recordStack.data.iterator.drop(1).takeWhile(r => !isUnbreakable(r))) {
                     enclosing.nestedTime += (delta - record.nestedTime)
                   }
-                  stacksWriter.write(recordStack.data.reverseIterator.map(_.name).mkString("", ";", ";"))
-                  stacksWriter.write((delta - record.nestedTime).toString)
-                  stacksWriter.write("\n")
+                  if (!isUnbreakable(record)) {
+                    val stack = recordStack.data.reverseIterator.map(_.flameName).mkString("", ";", "")
+                    flameStacks.getOrElseUpdate(stack, new FlamegraphStack(stack)) += delta - record.nestedTime
+                  }
                 }
               }
 
@@ -195,7 +211,7 @@ object ChromeTraceFlame {
                   if (name == "↯") {
                     record.savedStack = recordStack.data.toList
                     var i = 0
-                    for (enclosingToStop <- record.savedStack.reverseIterator.drop(1)) {
+                    for (enclosingToStop <- record.savedStack.reverseIterator.dropWhile(isUnbreakable)) {
                       i += 1
                       val durationRange: collect.Range[lang.Long] = com.google.common.collect.Range.closed[java.lang.Long](enclosingToStop.ts, ts)
                       writeCompleteEventWithGcCuts(recordStack, enclosingToStop, durationRange, i)
@@ -212,7 +228,7 @@ object ChromeTraceFlame {
                   if (name == "↯") {
                     recordStack.data = collection.mutable.ArrayStack[Record](record.savedStack: _*)
                     var i = 0
-                    for (restored <- record.savedStack.dropRight(1)) {
+                    for (restored <- record.savedStack.reverseIterator.dropWhile(isUnbreakable)) {
                       i += 1
                       restored.ts = ts// + i
                     }
@@ -282,11 +298,20 @@ object ChromeTraceFlame {
         generator.writeEndArray()
         generator.writeEndObject()
       }
+      val flameStacksArray: Array[FlamegraphStack] = flameStacks.valuesIterator.toArray
+      java.util.Arrays.sort(flameStacksArray, new Comparator[FlamegraphStack] {
+        override def compare(o1: FlamegraphStack, o2: FlamegraphStack): Int = java.lang.Long.compare(o2.duration, o1.duration)
+      })
+      for (stack <- flameStacksArray) {
+        stacksWriter.write(stack.stackString)
+        stacksWriter.write(" ")
+        stacksWriter.write(stack.duration.toString)
+        stacksWriter.write("\n")
+      }
     }
 
     try {
       parse(gcOnly = true)
-
       generator.writeStartObject()
       generator.writeFieldName("traceEvents")
       generator.writeStartArray()
