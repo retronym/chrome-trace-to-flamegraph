@@ -156,7 +156,6 @@ object ChromeTraceFlame {
               def writeCompleteEvent(recordStack: RecordStack, record: Record, durationRange: collect.Range[lang.Long], rangeFudge: Long): Unit = {
                 if ((durationRange.upperEndpoint() - durationRange.lowerEndpoint() > 100) && threadSlices.size > 0) {
                   val delta = durationRange.upperEndpoint() - durationRange.lowerEndpoint()
-                  generator.writeRaw("\n")
                   generator.writeStartObject()
                   generator.writeStringField("cat", record.cat)
                   generator.writeStringField("name", record.name)
@@ -169,13 +168,15 @@ object ChromeTraceFlame {
                   if (record.cname != "")
                     generator.writeStringField("cname", record.cname)
                   generator.writeEndObject()
+                  generator.writeRaw("\n")
 
+                  val adjustedNestedTime = math.max(0, (delta - record.nestedTime))
                   for (enclosing <- recordStack.data.iterator.drop(1).takeWhile(r => !isUnbreakable(r))) {
-                    enclosing.nestedTime += (delta - record.nestedTime)
+                    enclosing.nestedTime += adjustedNestedTime
                   }
                   if (!isUnbreakable(record)) {
                     val stack = recordStack.data.reverseIterator.map(_.flameName).mkString("", ";", "")
-                    flameStacks.getOrElseUpdate(stack, new FlamegraphStack(stack)) += delta - record.nestedTime
+                    flameStacks.getOrElseUpdate(stack, new FlamegraphStack(stack)) += adjustedNestedTime
                   }
                 }
               }
@@ -262,9 +263,9 @@ object ChromeTraceFlame {
                     generator.writeStringField("cname", cname)
                   generator.writeNumberField("dur", dur)
                   generator.writeEndObject()
+                  generator.writeRaw("\n")
                 case _ =>
               }
-              generator.writeRaw("\n")
             }
           }
           acceptNext(JsonToken.END_OBJECT)
@@ -293,6 +294,7 @@ object ChromeTraceFlame {
             generator.writeNumber(record.argValue)
             generator.writeEndObject()
             generator.writeEndObject()
+            generator.writeRaw("\n")
           }
         }
         generator.writeEndArray()
@@ -302,11 +304,13 @@ object ChromeTraceFlame {
       java.util.Arrays.sort(flameStacksArray, new Comparator[FlamegraphStack] {
         override def compare(o1: FlamegraphStack, o2: FlamegraphStack): Int = java.lang.Long.compare(o2.duration, o1.duration)
       })
-      for (stack <- flameStacksArray) {
+      for (i <- flameStacksArray.indices) {
+        val stack = flameStacksArray(i)
         stacksWriter.write(stack.stackString)
         stacksWriter.write(" ")
         stacksWriter.write(stack.duration.toString)
-        stacksWriter.write("\n")
+        if (i != flameStacksArray.length - 1)
+          stacksWriter.write("\n")
       }
     }
 
