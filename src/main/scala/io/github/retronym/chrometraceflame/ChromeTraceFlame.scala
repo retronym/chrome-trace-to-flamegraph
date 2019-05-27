@@ -62,9 +62,8 @@ object ChromeTraceFlame {
     val generator = factory.createGenerator(writer)
 
     def isUnbreakable(r: Record) = {
-      r.cat == "run" || r.cat == "phase"
+      r.cat == "run" || r.cat == "phase" || r.name == "↯"
     }
-
     def parse(gcOnly: Boolean): Unit = {
       for (file <- files) {
         val parser = factory.createParser(file.toFile)
@@ -164,13 +163,13 @@ object ChromeTraceFlame {
                   generator.writeStringField("tid", record.tid)
                   generator.writeStringField("pid", record.pid)
                   generator.writeNumberField("ts", durationRange.lowerEndpoint() + rangeFudge)
-                  generator.writeNumberField("dur", durationRange.upperEndpoint() - durationRange.lowerEndpoint() - rangeFudge * 2)
+                  generator.writeNumberField("dur", delta - rangeFudge * 2)
                   if (record.cname != "")
                     generator.writeStringField("cname", record.cname)
                   generator.writeEndObject()
                   generator.writeRaw("\n")
 
-                  val adjustedNestedTime = math.max(0, (delta - record.nestedTime))
+                  val adjustedNestedTime = math.max(0, (delta - rangeFudge * 2 - record.nestedTime))
                   for (enclosing <- recordStack.data.iterator.drop(1).takeWhile(r => !isUnbreakable(r))) {
                     enclosing.nestedTime += adjustedNestedTime
                   }
@@ -210,12 +209,14 @@ object ChromeTraceFlame {
                   record.cname = cname
 
                   if (name == "↯") {
+                    assert(record.savedStack == null, record)
                     record.savedStack = recordStack.data.toList
                     var i = 0
                     for (enclosingToStop <- record.savedStack.reverseIterator.dropWhile(isUnbreakable)) {
+                      assert(enclosingToStop.cat != "run")
                       i += 1
                       val durationRange: collect.Range[lang.Long] = com.google.common.collect.Range.closed[java.lang.Long](enclosingToStop.ts, ts)
-                      writeCompleteEventWithGcCuts(recordStack, enclosingToStop, durationRange, i)
+                      writeCompleteEventWithGcCuts(recordStack, enclosingToStop, durationRange, i + 1)
                     }
                     recordStack.data = mutable.ArrayStack[Record](record)
                   } else {
@@ -227,11 +228,12 @@ object ChromeTraceFlame {
                   record.duration = ts - record.ts
                   val durationRange: collect.Range[lang.Long] = com.google.common.collect.Range.closed[lang.Long](record.ts, record.ts + record.duration)
                   if (name == "↯") {
+                    writeCompleteEventWithGcCuts(recordStack, record, durationRange, 1)
                     recordStack.data = collection.mutable.ArrayStack[Record](record.savedStack: _*)
                     var i = 0
                     for (restored <- record.savedStack.reverseIterator.dropWhile(isUnbreakable)) {
                       i += 1
-                      restored.ts = ts// + i
+                      restored.ts = ts
                     }
                   } else {
                     writeCompleteEventWithGcCuts(recordStack, record, durationRange, recordStack.data.size)
